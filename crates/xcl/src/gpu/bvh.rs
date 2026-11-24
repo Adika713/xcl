@@ -217,6 +217,12 @@ fn transform_aabb(m: &[[f32; 4]; 3], (mn, mx): Aabb) -> Aabb {
 fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
     let a = |r: usize, c: usize| m[r][c] as f64;
     let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0)) + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
+    // Determinant magnitude depends on the transform's scale. A small determinant can
+    // still have a finite, representable inverse, so validate the inverse rather than
+    // applying an absolute cutoff here.
+    if det == 0.0 || !det.is_finite() {
+        return [0.0; 12];
+    }
     let inv = [
         [a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1), a(0, 2) * a(2, 1) - a(0, 1) * a(2, 2), a(0, 1) * a(1, 2) - a(0, 2) * a(1, 1)],
         [a(1, 2) * a(2, 0) - a(1, 0) * a(2, 2), a(0, 0) * a(2, 2) - a(0, 2) * a(2, 0), a(0, 2) * a(1, 0) - a(0, 0) * a(1, 2)],
@@ -230,6 +236,9 @@ fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
         for c in 0..3 {
             out[3 + 3 * r + c] = inv[r][c] as f32;
         }
+    }
+    if out.iter().any(|x| !x.is_finite()) {
+        return [0.0; 12];
     }
     out
 }
@@ -627,5 +636,19 @@ pub(crate) mod tests {
         let big = [[0.0, 0.0, 0.0], [1e10, 0.0, 0.0], [0.0, 1e10, 0.0]];
         assert!(triangle_hit(&big, [2e10, 2e10, -1.0], d).is_none());
         assert!(triangle_hit(&big, [2e9, 2e9, -1.0], d).is_some());
+    }
+
+    #[test]
+    fn world_to_object_keeps_small_invertible_transforms() {
+        // The determinant is 1e-31, but the inverse remains representable in f32.
+        let tiny = [[1e-11, 0.0, 0.0, 0.0], [0.0, 1e-10, 0.0, 0.0], [0.0, 0.0, 1e-10, 0.0]];
+        assert_eq!(
+            world_to_object(&tiny),
+            [0.0, 0.0, 0.0, 1e11, 0.0, 0.0, 0.0, 1e10, 0.0, 0.0, 0.0, 1e10]
+        );
+
+        // Invertible over f64, but its inverse cannot be stored as f32.
+        let tiny_inverse = [[1e-40, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+        assert_eq!(world_to_object(&tiny_inverse), [0.0; 12]);
     }
 }
