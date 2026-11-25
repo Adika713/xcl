@@ -5882,18 +5882,28 @@ const QUEUE_FIRST: usize = 14;
 /// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
 /// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
 unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    if (slot == 16 || slot == 17) && is_fence(a1) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
+    }
+    // Decide the layout once per call: a concurrent detection must not change the numbering
+    // halfway through a dispatch, and the test can pass explicit flags without touching globals.
+    let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
+    let mut older_layout = QUEUE_OLDER.load(Ordering::Acquire);
+    if (slot == 14 || slot == 15) && !shifted && is_fence(a1) && !older_layout {
+        QUEUE_OLDER.store(true, Ordering::Release);
+        older_layout = true;
+    }
+    queue_dispatch_with_layout(slot, this, a1, a2, a3, a4, shifted, older_layout)
+}
+
+/// `queue_dispatch` with the layout supplied by the caller, used by the slot-18 test so it does
+/// not reset process-global flags while other tests are running.
+unsafe fn queue_dispatch_with_layout(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, shifted: bool, older_layout: bool) -> usize {
     const PC_SIGNAL: usize = 14;
     const PC_WAIT: usize = 15;
     const PC_TIMESTAMP_FREQUENCY: usize = 16;
     const PC_CLOCK_CALIBRATION: usize = 17;
     const PC_GET_DESC: usize = 18;
-    if (slot == 16 || slot == 17) && is_fence(a1) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
-        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
-    }
-    let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
-    if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
-        QUEUE_OLDER.store(true, Ordering::Release);
-    }
     // the method in the older layout's numbering
     let older = if shifted && slot >= 16 { slot - 2 } else if shifted { usize::MAX } else { slot };
     let pc = |s: usize| orig_fn(this, s);
@@ -5927,7 +5937,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         // #18 before either layout is known: the older layout's GetDesc (a 16-byte structure) or
         // the newer one's GetTimestampFrequency (a UINT64). Only the first 8 bytes of the
         // description are written (type and priority), so an 8-byte out-param is not overrun.
-        18 if !shifted && !QUEUE_OLDER.load(Ordering::Acquire) => {
+        18 if !shifted && !older_layout => {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| crate::xlog_warn!("D3D12.X: queue #18 before the title's first Signal / Wait: the queue layout is not known yet, GetDesc writes only its first 8 bytes"));
             let f: unsafe extern "system" fn(*mut c_void, usize) -> usize = std::mem::transmute(pc(PC_GET_DESC));
@@ -6603,8 +6613,9 @@ mod queue_tests {
         0
     }
 
-    /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
-    /// layout) it is GetDesc with all 16.
+    /// Queue #18 before the layout is known writes 8 bytes; on the older layout it is GetDesc
+    /// with all 16. The layout is passed explicitly: resetting the process-global flags here used
+    /// to race with the other `hle::d3d12x` tests and crash the whole test process.
     #[test]
     fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
         let mut pc = [0usize; 32];
@@ -6614,23 +6625,15 @@ mod queue_tests {
         let vtbl = ext.as_ptr() as usize + 8;
         let mut obj = [vtbl];
         let this = obj.as_mut_ptr() as *mut c_void;
-        let fence = 0x5EED_0000usize;
-        QUEUE_SHIFTED.store(false, Ordering::Release);
-        QUEUE_OLDER.store(false, Ordering::Release);
         unsafe {
             let mut out = [0xAAAA_AAAAu32; 4];
-            let r = queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            let r = queue_dispatch_with_layout(18, this, out.as_mut_ptr() as usize, 0, 0, 0, false, false);
             assert_eq!(r, out.as_ptr() as usize);
             assert_eq!(out, [1, 2, 0xAAAA_AAAA, 0xAAAA_AAAA], "only the first 8 bytes");
-            FENCES.write().unwrap().push(fence);
-            queue_dispatch(14, this, fence, 1, 0, 0);
-            FENCES.write().unwrap().retain(|&f| f != fence);
-            assert!(QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.load(Ordering::Acquire));
             let mut out = [0xAAAA_AAAAu32; 4];
-            queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            queue_dispatch_with_layout(18, this, out.as_mut_ptr() as usize, 0, 0, 0, false, true);
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
-        QUEUE_OLDER.store(false, Ordering::Release);
     }
 }
 
